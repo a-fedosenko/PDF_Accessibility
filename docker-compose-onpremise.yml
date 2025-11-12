@@ -1,0 +1,482 @@
+version: '3.8'
+
+# ========================================================================
+# On-Premises Deployment - Docker Compose Configuration
+# ========================================================================
+# This configuration allows running PDF Accessibility Solutions on your
+# own servers with minimal AWS dependencies (only Bedrock for AI models)
+# ========================================================================
+
+services:
+  # ========================================================================
+  # Storage Service - MinIO (S3-compatible object storage)
+  # ========================================================================
+  minio:
+    image: minio/minio:latest
+    container_name: pdf-minio
+    ports:
+      - "9000:9000"      # API port
+      - "9001:9001"      # Console port
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # MinIO bucket initialization
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 10;
+      mc alias set myminio http://minio:9000 minioadmin minioadmin123;
+      mc mb myminio/pdfaccessibility || true;
+      mc mb myminio/pdf || true;
+      mc mb myminio/temp || true;
+      mc mb myminio/result || true;
+      mc policy set download myminio/result;
+      echo 'Buckets created successfully';
+      "
+    networks:
+      - pdf-network
+
+  # ========================================================================
+  # Database - PostgreSQL (for user management, job tracking)
+  # ========================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: pdf-postgres
+    environment:
+      POSTGRES_USER: pdfuser
+      POSTGRES_PASSWORD: pdfpassword
+      POSTGRES_DB: pdf_accessibility
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pdfuser"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # ========================================================================
+  # Message Queue - Redis (for job queuing and orchestration)
+  # ========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: pdf-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # ========================================================================
+  # Workflow Orchestrator - Temporal (replaces AWS Step Functions)
+  # Alternative: Airflow, Prefect, or Celery
+  # ========================================================================
+  temporal:
+    image: temporalio/auto-setup:latest
+    container_name: pdf-temporal
+    ports:
+      - "7233:7233"      # Temporal server
+      - "8088:8088"      # Temporal UI
+    environment:
+      - DB=postgresql
+      - DB_PORT=5432
+      - POSTGRES_USER=pdfuser
+      - POSTGRES_PWD=pdfpassword
+      - POSTGRES_SEEDS=postgres
+    depends_on:
+      - postgres
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # ========================================================================
+  # PDF Processing Services
+  # ========================================================================
+
+  # PDF Splitter Service
+  pdf-splitter:
+    build:
+      context: ./lambda/split_pdf
+      dockerfile: Dockerfile
+    container_name: pdf-splitter
+    environment:
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin123
+      - S3_BUCKET_NAME=pdfaccessibility
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_HOST=postgres
+      - POSTGRES_USER=pdfuser
+      - POSTGRES_PASSWORD=pdfpassword
+      - POSTGRES_DB=pdf_accessibility
+    volumes:
+      - ./data/temp:/tmp/pdf-processing
+    depends_on:
+      - minio
+      - redis
+      - postgres
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # Adobe PDF Auto-tagging Service (ECS Task 1)
+  pdf-autotag:
+    build:
+      context: ./docker_autotag
+      dockerfile: Dockerfile
+    container_name: pdf-autotag
+    environment:
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin123
+      - S3_BUCKET_NAME=pdfaccessibility
+      - PDF_SERVICES_CLIENT_ID=${PDF_SERVICES_CLIENT_ID}
+      - PDF_SERVICES_CLIENT_SECRET=${PDF_SERVICES_CLIENT_SECRET}
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./data/temp:/tmp/pdf-processing
+    depends_on:
+      - minio
+      - redis
+    networks:
+      - pdf-network
+    restart: unless-stopped
+    deploy:
+      replicas: 2  # Scale based on workload
+
+  # LLM Alt-text Generation Service (ECS Task 2)
+  # This still uses AWS Bedrock (Hybrid approach)
+  pdf-alttext:
+    build:
+      context: ./javascript_docker
+      dockerfile: Dockerfile
+    container_name: pdf-alttext
+    environment:
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin123
+      - S3_BUCKET_NAME=pdfaccessibility
+      - AWS_REGION=us-east-2
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - BEDROCK_MODEL_ARN_IMAGE=${BEDROCK_MODEL_ARN_IMAGE}
+      - BEDROCK_MODEL_ARN_LINK=${BEDROCK_MODEL_ARN_LINK}
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./data/temp:/tmp/pdf-processing
+    depends_on:
+      - minio
+      - redis
+    networks:
+      - pdf-network
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+
+  # PDF Merger Service
+  pdf-merger:
+    build:
+      context: ./lambda/java_lambda/PDFMergerLambda
+      dockerfile: Dockerfile
+    container_name: pdf-merger
+    environment:
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin123
+      - S3_BUCKET_NAME=pdfaccessibility
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./data/temp:/tmp/pdf-processing
+    depends_on:
+      - minio
+      - redis
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # Title Generator Service (uses Bedrock)
+  pdf-title-generator:
+    build:
+      context: ./lambda/add_title
+      dockerfile: Dockerfile
+    container_name: pdf-title-generator
+    environment:
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin123
+      - S3_BUCKET_NAME=pdfaccessibility
+      - AWS_REGION=us-east-2
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - BEDROCK_MODEL_ID=us.amazon.nova-pro-v1:0
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./data/temp:/tmp/pdf-processing
+    depends_on:
+      - minio
+      - redis
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # Accessibility Checker (Before)
+  pdf-checker-before:
+    build:
+      context: ./lambda/accessibility_checker_before_remidiation
+      dockerfile: Dockerfile
+    container_name: pdf-checker-before
+    environment:
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin123
+      - S3_BUCKET_NAME=pdfaccessibility
+      - PDF_SERVICES_CLIENT_ID=${PDF_SERVICES_CLIENT_ID}
+      - PDF_SERVICES_CLIENT_SECRET=${PDF_SERVICES_CLIENT_SECRET}
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./data/temp:/tmp/pdf-processing
+    depends_on:
+      - minio
+      - redis
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # Accessibility Checker (After)
+  pdf-checker-after:
+    build:
+      context: ./lambda/accessability_checker_after_remidiation
+      dockerfile: Dockerfile
+    container_name: pdf-checker-after
+    environment:
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin123
+      - S3_BUCKET_NAME=pdfaccessibility
+      - PDF_SERVICES_CLIENT_ID=${PDF_SERVICES_CLIENT_ID}
+      - PDF_SERVICES_CLIENT_SECRET=${PDF_SERVICES_CLIENT_SECRET}
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./data/temp:/tmp/pdf-processing
+    depends_on:
+      - minio
+      - redis
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # ========================================================================
+  # API Gateway & Backend
+  # ========================================================================
+
+  # API Gateway (Nginx + FastAPI/Flask backend)
+  api-gateway:
+    build:
+      context: ./onpremise/api-gateway
+      dockerfile: Dockerfile
+    container_name: pdf-api-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin123
+      - POSTGRES_HOST=postgres
+      - POSTGRES_USER=pdfuser
+      - POSTGRES_PASSWORD=pdfpassword
+      - POSTGRES_DB=pdf_accessibility
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-your-secret-key-change-me}
+    depends_on:
+      - postgres
+      - redis
+      - minio
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # ========================================================================
+  # Authentication Service - Keycloak (replaces AWS Cognito)
+  # ========================================================================
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    container_name: pdf-keycloak
+    environment:
+      - KEYCLOAK_ADMIN=admin
+      - KEYCLOAK_ADMIN_PASSWORD=admin123
+      - KC_DB=postgres
+      - KC_DB_URL=jdbc:postgresql://postgres:5432/pdf_accessibility
+      - KC_DB_USERNAME=pdfuser
+      - KC_DB_PASSWORD=pdfpassword
+      - KC_HOSTNAME=localhost
+      - KC_HTTP_ENABLED=true
+    ports:
+      - "8090:8080"
+    command: start-dev
+    depends_on:
+      - postgres
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # ========================================================================
+  # Frontend (React App with Nginx)
+  # ========================================================================
+  frontend:
+    build:
+      context: ./onpremise/frontend
+      dockerfile: Dockerfile
+    container_name: pdf-frontend
+    ports:
+      - "3000:80"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8080
+      - REACT_APP_KEYCLOAK_URL=http://localhost:8090
+      - REACT_APP_KEYCLOAK_REALM=pdf-accessibility
+      - REACT_APP_KEYCLOAK_CLIENT_ID=pdf-ui
+      - REACT_APP_MINIO_URL=http://localhost:9000
+    depends_on:
+      - api-gateway
+      - keycloak
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # ========================================================================
+  # Monitoring & Observability
+  # ========================================================================
+
+  # Prometheus (metrics collection)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: pdf-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./onpremise/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # Grafana (visualization)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: pdf-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_INSTALL_PLUGINS=redis-datasource
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./onpremise/monitoring/grafana-dashboards:/etc/grafana/provisioning/dashboards
+    depends_on:
+      - prometheus
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # Loki (log aggregation)
+  loki:
+    image: grafana/loki:latest
+    container_name: pdf-loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./onpremise/monitoring/loki-config.yml:/etc/loki/local-config.yaml
+      - loki-data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+# ========================================================================
+# Networks
+# ========================================================================
+networks:
+  pdf-network:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.25.0.0/16
+
+# ========================================================================
+# Volumes
+# ========================================================================
+volumes:
+  minio-data:
+    name: pdf-minio-data
+  postgres-data:
+    name: pdf-postgres-data
+  redis-data:
+    name: pdf-redis-data
+  prometheus-data:
+    name: pdf-prometheus-data
+  grafana-data:
+    name: pdf-grafana-data
+  loki-data:
+    name: pdf-loki-data
+
+# ========================================================================
+# Usage Instructions
+# ========================================================================
+#
+# 1. Create .env file with required credentials:
+#    - PDF_SERVICES_CLIENT_ID
+#    - PDF_SERVICES_CLIENT_SECRET
+#    - AWS_ACCESS_KEY_ID (for Bedrock only)
+#    - AWS_SECRET_ACCESS_KEY (for Bedrock only)
+#    - JWT_SECRET_KEY
+#
+# 2. Start all services:
+#    docker-compose -f docker-compose-onpremise.yml up -d
+#
+# 3. Access services:
+#    - Frontend: http://localhost:3000
+#    - API Gateway: http://localhost:8080
+#    - MinIO Console: http://localhost:9001
+#    - Keycloak: http://localhost:8090
+#    - Grafana: http://localhost:3001
+#    - Prometheus: http://localhost:9090
+#
+# 4. Upload PDFs to MinIO bucket 'pdfaccessibility/pdf/'
+#    or use the web UI at http://localhost:3000
+#
+# 5. Monitor processing in Grafana dashboards
+#
+# 6. Download results from MinIO bucket 'pdfaccessibility/result/'
+#
+# ========================================================================

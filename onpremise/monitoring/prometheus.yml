@@ -1,0 +1,162 @@
+# Prometheus configuration for PDF Accessibility Solutions (On-Premises)
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'pdf-accessibility-onprem'
+    environment: 'production'
+
+# Alertmanager configuration (optional)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#           - alertmanager:9093
+
+# Load rules once and periodically evaluate them
+# rule_files:
+#   - "rules/*.yml"
+
+# Scrape configurations
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          service: 'prometheus'
+
+  # API Gateway monitoring
+  - job_name: 'api-gateway'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['api-gateway:8080']
+        labels:
+          service: 'api-gateway'
+          component: 'backend'
+
+  # MinIO monitoring
+  - job_name: 'minio'
+    metrics_path: '/minio/v2/metrics/cluster'
+    scheme: http
+    static_configs:
+      - targets: ['minio:9000']
+        labels:
+          service: 'minio'
+          component: 'storage'
+
+  # PostgreSQL monitoring (requires postgres_exporter)
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres:5432']
+        labels:
+          service: 'postgres'
+          component: 'database'
+
+  # Redis monitoring (requires redis_exporter)
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:6379']
+        labels:
+          service: 'redis'
+          component: 'queue'
+
+  # PDF Processing Services
+  - job_name: 'pdf-splitter'
+    static_configs:
+      - targets: ['pdf-splitter:8080']
+        labels:
+          service: 'pdf-splitter'
+          component: 'processing'
+
+  - job_name: 'pdf-autotag'
+    static_configs:
+      - targets: ['pdf-autotag:8080']
+        labels:
+          service: 'pdf-autotag'
+          component: 'processing'
+
+  - job_name: 'pdf-alttext'
+    static_configs:
+      - targets: ['pdf-alttext:8080']
+        labels:
+          service: 'pdf-alttext'
+          component: 'processing'
+
+  - job_name: 'pdf-merger'
+    static_configs:
+      - targets: ['pdf-merger:8080']
+        labels:
+          service: 'pdf-merger'
+          component: 'processing'
+
+  - job_name: 'pdf-title-generator'
+    static_configs:
+      - targets: ['pdf-title-generator:8080']
+        labels:
+          service: 'pdf-title-generator'
+          component: 'processing'
+
+  - job_name: 'pdf-checker-before'
+    static_configs:
+      - targets: ['pdf-checker-before:8080']
+        labels:
+          service: 'pdf-checker-before'
+          component: 'processing'
+
+  - job_name: 'pdf-checker-after'
+    static_configs:
+      - targets: ['pdf-checker-after:8080']
+        labels:
+          service: 'pdf-checker-after'
+          component: 'processing'
+
+  # Temporal workflow orchestrator
+  - job_name: 'temporal'
+    static_configs:
+      - targets: ['temporal:7233']
+        labels:
+          service: 'temporal'
+          component: 'orchestration'
+
+  # Keycloak authentication
+  - job_name: 'keycloak'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['keycloak:8080']
+        labels:
+          service: 'keycloak'
+          component: 'authentication'
+
+  # Grafana monitoring
+  - job_name: 'grafana'
+    static_configs:
+      - targets: ['grafana:3000']
+        labels:
+          service: 'grafana'
+          component: 'monitoring'
+
+  # Loki log aggregation
+  - job_name: 'loki'
+    static_configs:
+      - targets: ['loki:3100']
+        labels:
+          service: 'loki'
+          component: 'logging'
+
+  # Node exporter for host metrics (if deployed)
+  # - job_name: 'node'
+  #   static_configs:
+  #     - targets: ['node-exporter:9100']
+  #       labels:
+  #         service: 'node-exporter'
+  #         component: 'system'
+
+  # cAdvisor for container metrics (if deployed)
+  # - job_name: 'cadvisor'
+  #   static_configs:
+  #     - targets: ['cadvisor:8080']
+  #       labels:
+  #         service: 'cadvisor'
+  #         component: 'containers'
