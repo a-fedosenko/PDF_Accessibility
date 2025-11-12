@@ -1,0 +1,289 @@
+version: '3.8'
+
+services:
+  # LocalStack - AWS Service Emulator for Local Development
+  localstack:
+    image: localstack/localstack:latest
+    container_name: pdf-accessibility-localstack
+    ports:
+      - "4566:4566"  # LocalStack edge port
+      - "4571:4571"  # S3 service
+    environment:
+      - SERVICES=s3,lambda,stepfunctions,secretsmanager,cloudwatch,iam,sts,bedrock
+      - DEBUG=1
+      - DATA_DIR=/tmp/localstack/data
+      - LAMBDA_EXECUTOR=docker-reuse
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - AWS_DEFAULT_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
+    volumes:
+      - "${LOCALSTACK_VOLUME_DIR:-./.localstack}:/tmp/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    networks:
+      - pdf-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Python Autotagging Container (ECS Task 1)
+  pdf-autotag:
+    build:
+      context: ./docker_autotag
+      dockerfile: Dockerfile
+    container_name: pdf-accessibility-autotag
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - PDF_SERVICES_CLIENT_ID=${PDF_SERVICES_CLIENT_ID}
+      - PDF_SERVICES_CLIENT_SECRET=${PDF_SERVICES_CLIENT_SECRET}
+      - LOCALSTACK_ENDPOINT=${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+    volumes:
+      - ./docker_autotag:/app
+      - pdf-temp-storage:/tmp/pdf-processing
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - pdf-network
+    command: tail -f /dev/null  # Keep container running for manual execution
+
+  # JavaScript Alt-text Generation Container (ECS Task 2)
+  pdf-alttext:
+    build:
+      context: ./javascript_docker
+      dockerfile: Dockerfile
+    container_name: pdf-accessibility-alttext
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - BEDROCK_MODEL_ARN_IMAGE=${BEDROCK_MODEL_ARN_IMAGE}
+      - BEDROCK_MODEL_ARN_LINK=${BEDROCK_MODEL_ARN_LINK}
+      - LOCALSTACK_ENDPOINT=${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+    volumes:
+      - ./javascript_docker:/app
+      - pdf-temp-storage:/tmp/pdf-processing
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - pdf-network
+    command: tail -f /dev/null  # Keep container running for manual execution
+
+  # PDF-to-HTML Lambda Container
+  pdf2html-lambda:
+    build:
+      context: ./pdf2html
+      dockerfile: Dockerfile
+    container_name: pdf-accessibility-pdf2html
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - BDA_S3_BUCKET=${BDA_S3_BUCKET}
+      - BDA_PROJECT_ARN=${BDA_PROJECT_ARN}
+      - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID:-us.amazon.nova-lite-v1:0}
+      - LOCALSTACK_ENDPOINT=${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+    volumes:
+      - ./pdf2html:/app
+      - pdf-output-storage:/output
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - pdf-network
+    ports:
+      - "9000:8080"  # Lambda Runtime Interface Emulator port
+    command: tail -f /dev/null  # Keep container running for manual execution
+
+  # Java Lambda - PDF Merger
+  java-lambda:
+    build:
+      context: ./lambda/java_lambda/PDFMergerLambda
+      dockerfile: Dockerfile
+    container_name: pdf-accessibility-java-merger
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - LOCALSTACK_ENDPOINT=${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+    volumes:
+      - ./lambda/java_lambda/PDFMergerLambda:/app
+      - pdf-temp-storage:/tmp/pdf-processing
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - pdf-network
+    command: tail -f /dev/null  # Keep container running for manual execution
+
+  # Python Lambda - Split PDF
+  split-pdf-lambda:
+    build:
+      context: ./lambda/split_pdf
+      dockerfile: Dockerfile
+    container_name: pdf-accessibility-split-pdf
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - STATE_MACHINE_ARN=${STATE_MACHINE_ARN}
+      - LOCALSTACK_ENDPOINT=${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+    volumes:
+      - ./lambda/split_pdf:/app
+      - pdf-temp-storage:/tmp/pdf-processing
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - pdf-network
+    command: tail -f /dev/null  # Keep container running for manual execution
+
+  # Python Lambda - Add Title
+  add-title-lambda:
+    build:
+      context: ./lambda/add_title
+      dockerfile: Dockerfile
+    container_name: pdf-accessibility-add-title
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - BEDROCK_MODEL_ID=${BEDROCK_TITLE_MODEL_ID:-us.amazon.nova-pro-v1:0}
+      - LOCALSTACK_ENDPOINT=${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+    volumes:
+      - ./lambda/add_title:/app
+      - pdf-temp-storage:/tmp/pdf-processing
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - pdf-network
+    command: tail -f /dev/null  # Keep container running for manual execution
+
+  # Python Lambda - Accessibility Checker (Before)
+  accessibility-checker-before:
+    build:
+      context: ./lambda/accessibility_checker_before_remidiation
+      dockerfile: Dockerfile
+    container_name: pdf-accessibility-checker-before
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - SECRET_NAME=${SECRET_NAME:-/myapp/client_credentials}
+      - LOCALSTACK_ENDPOINT=${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+    volumes:
+      - ./lambda/accessibility_checker_before_remidiation:/app
+      - pdf-temp-storage:/tmp/pdf-processing
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - pdf-network
+    command: tail -f /dev/null  # Keep container running for manual execution
+
+  # Python Lambda - Accessibility Checker (After)
+  accessibility-checker-after:
+    build:
+      context: ./lambda/accessability_checker_after_remidiation
+      dockerfile: Dockerfile
+    container_name: pdf-accessibility-checker-after
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - SECRET_NAME=${SECRET_NAME:-/myapp/client_credentials}
+      - LOCALSTACK_ENDPOINT=${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+    volumes:
+      - ./lambda/accessability_checker_after_remidiation:/app
+      - pdf-temp-storage:/tmp/pdf-processing
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - pdf-network
+    command: tail -f /dev/null  # Keep container running for manual execution
+
+  # S3 Bucket Initialization - Creates required S3 buckets in LocalStack
+  s3-init:
+    image: amazon/aws-cli:latest
+    container_name: pdf-accessibility-s3-init
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - pdf-network
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        echo "Waiting for LocalStack to be ready..."
+        sleep 10
+        echo "Creating S3 buckets..."
+        aws --endpoint-url=http://localstack:4566 s3 mb s3://${S3_BUCKET_NAME:-pdfaccessibility-local} || true
+        aws --endpoint-url=http://localstack:4566 s3 mb s3://${BDA_S3_BUCKET:-pdf2html-bucket-local} || true
+        echo "Creating bucket folders..."
+        aws --endpoint-url=http://localstack:4566 s3api put-object --bucket ${S3_BUCKET_NAME:-pdfaccessibility-local} --key pdf/ || true
+        aws --endpoint-url=http://localstack:4566 s3api put-object --bucket ${S3_BUCKET_NAME:-pdfaccessibility-local} --key temp/ || true
+        aws --endpoint-url=http://localstack:4566 s3api put-object --bucket ${S3_BUCKET_NAME:-pdfaccessibility-local} --key result/ || true
+        aws --endpoint-url=http://localstack:4566 s3api put-object --bucket ${BDA_S3_BUCKET:-pdf2html-bucket-local} --key uploads/ || true
+        aws --endpoint-url=http://localstack:4566 s3api put-object --bucket ${BDA_S3_BUCKET:-pdf2html-bucket-local} --key output/ || true
+        aws --endpoint-url=http://localstack:4566 s3api put-object --bucket ${BDA_S3_BUCKET:-pdf2html-bucket-local} --key remediated/ || true
+        echo "S3 buckets created successfully!"
+        echo "Buckets available at: http://localhost:4566"
+    restart: "no"
+
+  # Secrets Manager Initialization - Creates Adobe API credentials secret
+  secrets-init:
+    image: amazon/aws-cli:latest
+    container_name: pdf-accessibility-secrets-init
+    environment:
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - pdf-network
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        echo "Waiting for LocalStack to be ready..."
+        sleep 10
+        echo "Creating Secrets Manager secret..."
+        aws --endpoint-url=http://localstack:4566 secretsmanager create-secret \
+          --name ${SECRET_NAME:-/myapp/client_credentials} \
+          --description "Adobe PDF Services API credentials" \
+          --secret-string "{\"client_credentials\":{\"PDF_SERVICES_CLIENT_ID\":\"${PDF_SERVICES_CLIENT_ID}\",\"PDF_SERVICES_CLIENT_SECRET\":\"${PDF_SERVICES_CLIENT_SECRET}\"}}" \
+          || echo "Secret already exists or creation failed"
+        echo "Secrets initialized successfully!"
+    restart: "no"
+
+networks:
+  pdf-network:
+    driver: bridge
+    name: pdf-accessibility-network
+
+volumes:
+  pdf-temp-storage:
+    name: pdf-accessibility-temp
+  pdf-output-storage:
+    name: pdf-accessibility-output

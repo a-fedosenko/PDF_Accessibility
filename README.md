@@ -54,7 +54,7 @@ We provide a **unified deployment script** that allows you to deploy either or b
 **Step 1: Open AWS CloudShell and Clone the Repository**
 
 ```bash
-git clone https://github.com/ASUCICREPO/PDF_Accessibility.git
+git clone https://github.com/a-fedosenko/PDF_Accessibility.git
 cd PDF_Accessibility
 ```
 
@@ -256,7 +256,7 @@ The PDF-to-HTML remediation functionality in this project is adapted from AWS La
 For questions, issues, or support:
 
 - **Email**: ai-cic@amazon.com
-- **Issues**: [GitHub Issues](https://github.com/ASUCICREPO/PDF_Accessibility/issues)
+- **Issues**: [GitHub Issues](https://github.com/a-fedosenko/PDF_Accessibility/issues)
 
 ---
 

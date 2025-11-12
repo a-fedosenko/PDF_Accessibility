@@ -1,0 +1,341 @@
+version: '3.8'
+
+# Production Docker Compose for AWS Deployment
+# This configuration is designed for deployment on AWS infrastructure
+# Uses real AWS services (not LocalStack)
+
+services:
+  # Python Autotagging Container (ECS Task 1)
+  pdf-autotag:
+    build:
+      context: ./docker_autotag
+      dockerfile: Dockerfile
+      args:
+        - BUILDKIT_INLINE_CACHE=1
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY_AUTOTAG}:${IMAGE_TAG:-latest}
+    container_name: pdf-accessibility-autotag
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_DEFAULT_REGION=${AWS_REGION}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      # AWS credentials handled via IAM roles in ECS
+    secrets:
+      - adobe_credentials
+    volumes:
+      - /tmp/pdf-processing:/tmp/pdf-processing
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /ecs/MyFirstTaskDef/PythonContainerLogGroup
+        awslogs-stream-prefix: pdf-autotag
+        awslogs-create-group: "true"
+    deploy:
+      resources:
+        limits:
+          cpus: '${ECS_TASK_CPU:-2048}'
+          memory: ${ECS_TASK_MEMORY:-4096}M
+        reservations:
+          cpus: '${ECS_TASK_CPU_RESERVATION:-1024}'
+          memory: ${ECS_TASK_MEMORY_RESERVATION:-2048}M
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # JavaScript Alt-text Generation Container (ECS Task 2)
+  pdf-alttext:
+    build:
+      context: ./javascript_docker
+      dockerfile: Dockerfile
+      args:
+        - BUILDKIT_INLINE_CACHE=1
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY_ALTTEXT}:${IMAGE_TAG:-latest}
+    container_name: pdf-accessibility-alttext
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_DEFAULT_REGION=${AWS_REGION}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - BEDROCK_MODEL_ARN_IMAGE=${BEDROCK_MODEL_ARN_IMAGE}
+      - BEDROCK_MODEL_ARN_LINK=${BEDROCK_MODEL_ARN_LINK}
+    volumes:
+      - /tmp/pdf-processing:/tmp/pdf-processing
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /ecs/MySecondTaskDef/JavaScriptContainerLogGroup
+        awslogs-stream-prefix: pdf-alttext
+        awslogs-create-group: "true"
+    deploy:
+      resources:
+        limits:
+          cpus: '${ECS_TASK_CPU:-2048}'
+          memory: ${ECS_TASK_MEMORY:-4096}M
+        reservations:
+          cpus: '${ECS_TASK_CPU_RESERVATION:-1024}'
+          memory: ${ECS_TASK_MEMORY_RESERVATION:-2048}M
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # PDF-to-HTML Lambda Container
+  pdf2html-lambda:
+    build:
+      context: ./pdf2html
+      dockerfile: Dockerfile
+      args:
+        - BUILDKIT_INLINE_CACHE=1
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY_PDF2HTML}:${IMAGE_TAG:-latest}
+    container_name: pdf-accessibility-pdf2html
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_DEFAULT_REGION=${AWS_REGION}
+      - BDA_S3_BUCKET=${BDA_S3_BUCKET}
+      - BDA_PROJECT_ARN=${BDA_PROJECT_ARN}
+      - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID:-us.amazon.nova-lite-v1:0}
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /aws/lambda/Pdf2HtmlPipeline
+        awslogs-stream-prefix: pdf2html
+        awslogs-create-group: "true"
+    deploy:
+      resources:
+        limits:
+          cpus: '${LAMBDA_CPU:-1024}'
+          memory: ${LAMBDA_MEMORY:-2048}M
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # Java Lambda - PDF Merger
+  java-lambda:
+    build:
+      context: ./lambda/java_lambda/PDFMergerLambda
+      dockerfile: Dockerfile
+      args:
+        - BUILDKIT_INLINE_CACHE=1
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY_JAVA_LAMBDA}:${IMAGE_TAG:-latest}
+    container_name: pdf-accessibility-java-merger
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_DEFAULT_REGION=${AWS_REGION}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+    volumes:
+      - /tmp/pdf-processing:/tmp/pdf-processing
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /aws/lambda/PDFAccessibility-JavaLambda
+        awslogs-stream-prefix: java-lambda
+        awslogs-create-group: "true"
+    deploy:
+      resources:
+        limits:
+          cpus: '${LAMBDA_CPU:-1024}'
+          memory: ${LAMBDA_MEMORY:-2048}M
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # Python Lambda - Split PDF
+  split-pdf-lambda:
+    build:
+      context: ./lambda/split_pdf
+      dockerfile: Dockerfile
+      args:
+        - BUILDKIT_INLINE_CACHE=1
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY_SPLIT_PDF}:${IMAGE_TAG:-latest}
+    container_name: pdf-accessibility-split-pdf
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_DEFAULT_REGION=${AWS_REGION}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - STATE_MACHINE_ARN=${STATE_MACHINE_ARN}
+    volumes:
+      - /tmp/pdf-processing:/tmp/pdf-processing
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /aws/lambda/PDFAccessibility-SplitPDF
+        awslogs-stream-prefix: split-pdf
+        awslogs-create-group: "true"
+    deploy:
+      resources:
+        limits:
+          cpus: '${LAMBDA_CPU:-1024}'
+          memory: ${LAMBDA_MEMORY:-2048}M
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # Python Lambda - Add Title
+  add-title-lambda:
+    build:
+      context: ./lambda/add_title
+      dockerfile: Dockerfile
+      args:
+        - BUILDKIT_INLINE_CACHE=1
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY_ADD_TITLE}:${IMAGE_TAG:-latest}
+    container_name: pdf-accessibility-add-title
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_DEFAULT_REGION=${AWS_REGION}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - BEDROCK_MODEL_ID=${BEDROCK_TITLE_MODEL_ID:-us.amazon.nova-pro-v1:0}
+    volumes:
+      - /tmp/pdf-processing:/tmp/pdf-processing
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /aws/lambda/PDFAccessibility-AddTitleLambda
+        awslogs-stream-prefix: add-title
+        awslogs-create-group: "true"
+    deploy:
+      resources:
+        limits:
+          cpus: '${LAMBDA_CPU:-1024}'
+          memory: ${LAMBDA_MEMORY:-1024}M
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # Python Lambda - Accessibility Checker (Before)
+  accessibility-checker-before:
+    build:
+      context: ./lambda/accessibility_checker_before_remidiation
+      dockerfile: Dockerfile
+      args:
+        - BUILDKIT_INLINE_CACHE=1
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY_CHECKER_BEFORE}:${IMAGE_TAG:-latest}
+    container_name: pdf-accessibility-checker-before
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_DEFAULT_REGION=${AWS_REGION}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - SECRET_NAME=${SECRET_NAME:-/myapp/client_credentials}
+    volumes:
+      - /tmp/pdf-processing:/tmp/pdf-processing
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /aws/lambda/PDFAccessibility-CheckerBefore
+        awslogs-stream-prefix: checker-before
+        awslogs-create-group: "true"
+    deploy:
+      resources:
+        limits:
+          cpus: '${LAMBDA_CPU:-1024}'
+          memory: ${LAMBDA_MEMORY:-1024}M
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # Python Lambda - Accessibility Checker (After)
+  accessibility-checker-after:
+    build:
+      context: ./lambda/accessability_checker_after_remidiation
+      dockerfile: Dockerfile
+      args:
+        - BUILDKIT_INLINE_CACHE=1
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY_CHECKER_AFTER}:${IMAGE_TAG:-latest}
+    container_name: pdf-accessibility-checker-after
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_DEFAULT_REGION=${AWS_REGION}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - SECRET_NAME=${SECRET_NAME:-/myapp/client_credentials}
+    volumes:
+      - /tmp/pdf-processing:/tmp/pdf-processing
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /aws/lambda/PDFAccessibility-CheckerAfter
+        awslogs-stream-prefix: checker-after
+        awslogs-create-group: "true"
+    deploy:
+      resources:
+        limits:
+          cpus: '${LAMBDA_CPU:-1024}'
+          memory: ${LAMBDA_MEMORY:-1024}M
+    networks:
+      - pdf-network
+    restart: unless-stopped
+
+  # Monitoring and Metrics Exporter (Optional)
+  cloudwatch-exporter:
+    image: prom/cloudwatch-exporter:latest
+    container_name: pdf-accessibility-cloudwatch-exporter
+    environment:
+      - AWS_REGION=${AWS_REGION}
+    volumes:
+      - ./monitoring/cloudwatch-exporter.yml:/config/config.yml:ro
+    ports:
+      - "9106:9106"
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /monitoring/cloudwatch-exporter
+        awslogs-stream-prefix: exporter
+        awslogs-create-group: "true"
+    networks:
+      - pdf-network
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  # Nginx Reverse Proxy (Optional - for HTTP endpoints)
+  nginx:
+    image: nginx:alpine
+    container_name: pdf-accessibility-nginx
+    ports:
+      - "${NGINX_PORT:-80}:80"
+      - "${NGINX_SSL_PORT:-443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - nginx-cache:/var/cache/nginx
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /nginx/pdf-accessibility
+        awslogs-stream-prefix: nginx
+        awslogs-create-group: "true"
+    networks:
+      - pdf-network
+    restart: unless-stopped
+    profiles:
+      - frontend
+    depends_on:
+      - pdf2html-lambda
+
+# Secrets management for sensitive data
+secrets:
+  adobe_credentials:
+    external: true
+    name: ${SECRET_NAME:-/myapp/client_credentials}
+
+networks:
+  pdf-network:
+    driver: bridge
+    name: pdf-accessibility-network
+    ipam:
+      driver: default
+      config:
+        - subnet: ${SUBNET_CIDR:-172.20.0.0/16}
+
+volumes:
+  nginx-cache:
+    name: pdf-accessibility-nginx-cache
+
+# Deployment configurations
+# Use with: docker-compose --profile monitoring up
+# Or: docker-compose --profile frontend up
