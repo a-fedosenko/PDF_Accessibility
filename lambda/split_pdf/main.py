@@ -20,7 +20,11 @@ cloudwatch = boto3.client('cloudwatch')
 s3_client = boto3.client('s3')
 stepfunctions = boto3.client('stepfunctions')
 
+# Get configuration from environment variables
 state_machine_arn = os.environ['STATE_MACHINE_ARN']
+PDF_CHUNK_SIZE = int(os.environ.get('PDF_CHUNK_SIZE', '200'))
+MAX_PAGES_PER_PDF = int(os.environ.get('MAX_PAGES_PER_PDF', '10000'))
+MAX_PDF_FILE_SIZE = int(os.environ.get('MAX_PDF_FILE_SIZE', '5368709120'))  # 5GB default
 
 def log_chunk_created(filename):
     """
@@ -47,11 +51,11 @@ def log_chunk_created(filename):
 def split_pdf_into_pages(source_content, original_key, s3_client, bucket_name, pages_per_chunk):
     """
     Splits a PDF file into chunks of specified page size and uploads each chunk to S3.
-    
-    This function takes a PDF file's content, splits it into chunks of the specified number 
-    of pages, and uploads each chunk back to the S3 bucket. It also returns metadata about 
+
+    This function takes a PDF file's content, splits it into chunks of the specified number
+    of pages, and uploads each chunk back to the S3 bucket. It also returns metadata about
     the uploaded chunks for further processing.
-    
+
     Parameters:
         source_content (bytes): The binary content of the PDF file.
         original_key (str): The original S3 key of the PDF file.
@@ -63,9 +67,13 @@ def split_pdf_into_pages(source_content, original_key, s3_client, bucket_name, p
         list: A list of dictionaries containing metadata for each uploaded chunk.
     """
     from pypdf import PdfReader, PdfWriter
-    
+
     reader = PdfReader(io.BytesIO(source_content))
     num_pages = len(reader.pages)
+
+    # Check if PDF exceeds maximum page limit (if limit is set)
+    if MAX_PAGES_PER_PDF > 0 and num_pages > MAX_PAGES_PER_PDF:
+        raise ValueError(f"PDF has {num_pages} pages, which exceeds the maximum of {MAX_PAGES_PER_PDF} pages")
     file_basename = original_key.split('/')[-1].rsplit('.', 1)[0]
     
     chunks = []
@@ -140,10 +148,17 @@ def lambda_handler(event, context):
         # Get the PDF file from S3
         response = s3.get_object(Bucket=bucket_name, Key=pdf_file_key)
         print(f'Filename - {pdf_file_key} | The response is: {response}')
+
+        # Check file size (if limit is set)
+        content_length = response['ContentLength']
+        if MAX_PDF_FILE_SIZE > 0 and content_length > MAX_PDF_FILE_SIZE:
+            raise ValueError(f"PDF file size ({content_length} bytes) exceeds the maximum of {MAX_PDF_FILE_SIZE} bytes ({MAX_PDF_FILE_SIZE / (1024**3):.2f} GB)")
+
         pdf_file_content = response['Body'].read()
-  
+
         # Split the PDF into pages and upload them to S3
-        chunks = split_pdf_into_pages(pdf_file_content, pdf_file_key, s3, bucket_name, 200)
+        print(f'Using PDF_CHUNK_SIZE: {PDF_CHUNK_SIZE} pages per chunk')
+        chunks = split_pdf_into_pages(pdf_file_content, pdf_file_key, s3, bucket_name, PDF_CHUNK_SIZE)
         
         log_chunk_created(file_basename)
 

@@ -19,6 +19,7 @@ from aws_cdk import (
 from constructs import Construct
 import platform
 import datetime
+import os
 
 class PDFAccessibility(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
@@ -168,6 +169,10 @@ class PDFAccessibility(Stack):
                                             tasks.TaskEnvironmentVariable(
                                                   name="AWS_REGION",
                                                   value=region
+                                              ),
+                                            tasks.TaskEnvironmentVariable(
+                                                  name="MAX_IMAGE_SIZE",
+                                                  value=os.environ.get('MAX_IMAGE_SIZE', '20000000')
                                               ),
                                           ]
                                       )],
@@ -361,7 +366,12 @@ class PDFAccessibility(Stack):
             handler='main.lambda_handler',
             code=lambda_.Code.from_docker_build("lambda/split_pdf"),
             timeout=Duration.seconds(900),
-            memory_size=1024
+            memory_size=int(os.environ.get('LAMBDA_MEMORY_SIZE', '3008')),  # Increased for large PDF processing
+            environment={
+                'PDF_CHUNK_SIZE': os.environ.get('PDF_CHUNK_SIZE', '200'),
+                'MAX_PAGES_PER_PDF': os.environ.get('MAX_PAGES_PER_PDF', '10000'),
+                'MAX_PDF_FILE_SIZE': os.environ.get('MAX_PDF_FILE_SIZE', '5368709120'),
+            }
         )
 
         split_pdf_lambda.add_to_role_policy(cloudwatch_logs_policy)
