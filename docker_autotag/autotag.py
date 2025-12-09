@@ -86,10 +86,38 @@ from adobe.pdfservices.operation.pdfjobs.jobs.autotag_pdf_job import AutotagPDFJ
 from adobe.pdfservices.operation.pdfjobs.params.autotag_pdf.autotag_pdf_params import AutotagPDFParams
 from adobe.pdfservices.operation.pdfjobs.result.autotag_pdf_result import AutotagPDFResult
 
+# Import quota monitoring utilities
+sys.path.insert(0, '/app/pdf2html/content_accessibility_utility_on_aws/utils')
+try:
+    from quota_monitor import QuotaMonitor
+except ImportError:
+    logging.warning("QuotaMonitor not available, quota tracking disabled")
+    QuotaMonitor = None
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 s3 = boto3.client('s3')
+
+# Initialize quota monitor for Adobe API
+quota_monitor = None
+if QuotaMonitor:
+    try:
+        adobe_quota_limit = int(os.environ.get('ADOBE_API_QUOTA_LIMIT', '0'))
+        if adobe_quota_limit > 0:
+            quota_monitor = QuotaMonitor(
+                api_name="AdobeAPI",
+                quota_limit=adobe_quota_limit,
+                warning_threshold=0.8,
+                critical_threshold=0.95
+            )
+            logger.info(f"Adobe API quota monitor initialized with limit: {adobe_quota_limit}")
+        else:
+            logger.info("Adobe API quota limit not set, tracking without limit enforcement")
+            quota_monitor = QuotaMonitor(api_name="AdobeAPI", quota_limit=None)
+    except Exception as e:
+        logger.warning(f"Failed to initialize quota monitor: {e}")
+        quota_monitor = None
 
 def download_file_from_s3(bucket_name,file_base_name, file_key, local_path):
     """
@@ -171,10 +199,16 @@ def add_viewer_preferences(pdf_path, filename):
     logger.info(f'Filename : {filename} | Viewer preferences added to the PDF')
 
 def autotag_pdf_with_options(filename, client_id, client_secret):
+    # Check if quota is available before making API call
+    if quota_monitor and not quota_monitor.check_quota_available():
+        error_msg = f"Adobe API quota limit exceeded. Cannot process {filename}."
+        logger.error(error_msg)
+        raise Exception(error_msg)
+
     try:
         with open(filename, 'rb') as file:
             input_stream = file.read()
-        
+
 
         # Initial setup, create credentials instance
         credentials = ServicePrincipalCredentials(
@@ -223,9 +257,45 @@ def autotag_pdf_with_options(filename, client_id, client_secret):
         with open(output_file_path_report, "wb") as file:
             file.write(stream_asset_report.get_input_stream())
 
-    except (ServiceApiException, ServiceUsageException, SdkException) as e:
-        logging.exception(f'Filename : {filename} | Exception encountered while executing operation: {e}')
+        # Track successful API call
+        if quota_monitor:
+            result = quota_monitor.track_api_call(operation="AutotagPDF", success=True)
+            if result.get("quota_exceeded"):
+                logger.warning(f"Quota exceeded after processing {filename}")
+            elif result.get("alert_sent"):
+                logger.warning(f"Quota alert sent: {result.get('usage_percentage', 0)*100:.1f}% used")
+
+    except ServiceUsageException as e:
+        error_str = str(e).lower()
+        if "quota" in error_str or "limit" in error_str or "usage" in error_str:
+            # This is a quota-related error
+            logger.error(f'Filename : {filename} | Adobe API quota limit reached: {e}')
+            if quota_monitor:
+                quota_monitor.track_api_call(operation="AutotagPDF", success=False, error_type="QuotaExceeded")
+            raise Exception(f"Adobe API quota limit exceeded. Please check your Adobe account or wait for quota reset.")
+        else:
+            # Other service usage exception
+            logger.exception(f'Filename : {filename} | Service usage exception: {e}')
+            if quota_monitor:
+                quota_monitor.track_api_call(operation="AutotagPDF", success=False, error_type="ServiceUsage")
+            raise
+    except ServiceApiException as e:
+        logger.exception(f'Filename : {filename} | Service API exception: {e}')
+        if quota_monitor:
+            quota_monitor.track_api_call(operation="AutotagPDF", success=False, error_type="ServiceAPI")
+        raise
+    except SdkException as e:
+        logger.exception(f'Filename : {filename} | SDK exception: {e}')
+        if quota_monitor:
+            quota_monitor.track_api_call(operation="AutotagPDF", success=False, error_type="SDK")
+        raise
 def extract_api(filename, client_id, client_secret):
+    # Check if quota is available before making API call
+    if quota_monitor and not quota_monitor.check_quota_available():
+        error_msg = f"Adobe API quota limit exceeded. Cannot extract from {filename}."
+        logger.error(error_msg)
+        raise Exception(error_msg)
+
     try:
         with open(filename, 'rb') as file:
             input_stream = file.read()
@@ -268,8 +338,38 @@ def extract_api(filename, client_id, client_secret):
         with open(output_file_path, "wb") as file:
             file.write(stream_asset.get_input_stream())
 
-    except (ServiceApiException, ServiceUsageException, SdkException) as e:
-        logging.exception(f'Exception encountered while executing operation: {e}')
+        # Track successful API call
+        if quota_monitor:
+            result = quota_monitor.track_api_call(operation="ExtractPDF", success=True)
+            if result.get("quota_exceeded"):
+                logger.warning(f"Quota exceeded after extracting {filename}")
+            elif result.get("alert_sent"):
+                logger.warning(f"Quota alert sent: {result.get('usage_percentage', 0)*100:.1f}% used")
+
+    except ServiceUsageException as e:
+        error_str = str(e).lower()
+        if "quota" in error_str or "limit" in error_str or "usage" in error_str:
+            # This is a quota-related error
+            logger.error(f'Filename : {filename} | Adobe API quota limit reached: {e}')
+            if quota_monitor:
+                quota_monitor.track_api_call(operation="ExtractPDF", success=False, error_type="QuotaExceeded")
+            raise Exception(f"Adobe API quota limit exceeded. Please check your Adobe account or wait for quota reset.")
+        else:
+            # Other service usage exception
+            logger.exception(f'Filename : {filename} | Service usage exception: {e}')
+            if quota_monitor:
+                quota_monitor.track_api_call(operation="ExtractPDF", success=False, error_type="ServiceUsage")
+            raise
+    except ServiceApiException as e:
+        logger.exception(f'Filename : {filename} | Service API exception: {e}')
+        if quota_monitor:
+            quota_monitor.track_api_call(operation="ExtractPDF", success=False, error_type="ServiceAPI")
+        raise
+    except SdkException as e:
+        logger.exception(f'Filename : {filename} | SDK exception: {e}')
+        if quota_monitor:
+            quota_monitor.track_api_call(operation="ExtractPDF", success=False, error_type="SDK")
+        raise
 
 def unzip_file(filename,zip_path, extract_to):
     """

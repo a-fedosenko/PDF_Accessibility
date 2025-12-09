@@ -14,7 +14,11 @@ from aws_cdk import (
     aws_logs as logs,
     aws_ecr_assets as ecr_assets,
     aws_cloudwatch as cloudwatch,
-    aws_secretsmanager as secretsmanager
+    aws_secretsmanager as secretsmanager,
+    aws_sns as sns,
+    aws_sns_subscriptions as sns_subscriptions,
+    aws_cloudwatch_actions as cw_actions,
+    aws_dynamodb as dynamodb
 )
 from constructs import Construct
 import platform
@@ -26,8 +30,8 @@ class PDFAccessibility(Stack):
         super().__init__(scope, construct_id, **kwargs)
         
         # S3 Bucket
-        bucket = s3.Bucket(self, "pdfaccessibilitybucket1", 
-                          encryption=s3.BucketEncryption.S3_MANAGED, 
+        bucket = s3.Bucket(self, "pdfaccessibilitybucket1",
+                          encryption=s3.BucketEncryption.S3_MANAGED,
                           enforce_ssl=True,
                           cors=[s3.CorsRule(
                               allowed_headers=["*"],
@@ -35,7 +39,37 @@ class PDFAccessibility(Stack):
                               allowed_origins=["*"],
                               exposed_headers=[]
                           )])
-    
+
+        # SNS Topic for Quota Alerts
+        quota_alert_topic = sns.Topic(
+            self, "QuotaAlertTopic",
+            display_name="PDF Accessibility Quota Alerts",
+            topic_name="pdf-accessibility-quota-alerts"
+        )
+
+        # Add email subscription (you can configure this via environment variable)
+        alert_email = os.environ.get('QUOTA_ALERT_EMAIL')
+        if alert_email:
+            quota_alert_topic.add_subscription(
+                sns_subscriptions.EmailSubscription(alert_email)
+            )
+
+        # DynamoDB Table for Usage Tracking
+        usage_tracking_table = dynamodb.Table(
+            self, "UsageTrackingTable",
+            table_name="pdf-accessibility-usage",
+            partition_key=dynamodb.Attribute(
+                name="api_name",
+                type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="period",
+                type=dynamodb.AttributeType.STRING
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=cdk.RemovalPolicy.RETAIN,
+            point_in_time_recovery=True
+        )
 
         python_image_asset = ecr_assets.DockerImageAsset(self, "PythonImage",
                                                          directory="docker_autotag",
@@ -91,9 +125,19 @@ class PDFAccessibility(Stack):
             resources=["*"],   # This applies the actions to all resources
         ))
         ecs_task_role.add_to_policy(iam.PolicyStatement(actions=
-                                                        ["secretsmanager:GetSecretValue"], 
+                                                        ["secretsmanager:GetSecretValue"],
                                                          resources=[f"arn:aws:secretsmanager:{region}:{account_id}:secret:/myapp/db_credentials"] )
                                                          )
+        # Grant permissions for quota monitoring
+        ecs_task_role.add_to_policy(iam.PolicyStatement(
+            actions=["cloudwatch:PutMetricData"],
+            resources=["*"]
+        ))
+        ecs_task_role.add_to_policy(iam.PolicyStatement(
+            actions=["sns:Publish"],
+            resources=[quota_alert_topic.topic_arn]
+        ))
+        usage_tracking_table.grant_read_write_data(ecs_task_role)
         # Grant S3 read/write access to ECS Task Role
         bucket.grant_read_write(ecs_task_execution_role)
         # Create ECS Task Log Groups explicitly
@@ -173,6 +217,18 @@ class PDFAccessibility(Stack):
                                             tasks.TaskEnvironmentVariable(
                                                   name="MAX_IMAGE_SIZE",
                                                   value=os.environ.get('MAX_IMAGE_SIZE', '20000000')
+                                              ),
+                                            tasks.TaskEnvironmentVariable(
+                                                  name="QUOTA_ALERT_SNS_TOPIC_ARN",
+                                                  value=quota_alert_topic.topic_arn
+                                              ),
+                                            tasks.TaskEnvironmentVariable(
+                                                  name="USAGE_TRACKING_TABLE",
+                                                  value=usage_tracking_table.table_name
+                                              ),
+                                            tasks.TaskEnvironmentVariable(
+                                                  name="ADOBE_API_QUOTA_LIMIT",
+                                                  value=os.environ.get('ADOBE_API_QUOTA_LIMIT', '0')
                                               ),
                                           ]
                                       )],
@@ -466,6 +522,138 @@ class PDFAccessibility(Stack):
                 width=24,
                 height=6
             ),
+        )
+
+        # CloudWatch Alarms for Adobe API Quota Monitoring
+        # Alarm for 80% quota usage (Warning)
+        quota_warning_alarm = cloudwatch.Alarm(
+            self, "AdobeAPIQuotaWarning",
+            alarm_name="adobe-api-quota-warning",
+            alarm_description="Alert when Adobe API usage reaches 80% of quota",
+            metric=cloudwatch.Metric(
+                namespace="PDFAccessibility",
+                metric_name="QuotaUsagePercentage",
+                dimensions_map={
+                    "APIName": "AdobeAPI",
+                    "Period": "Monthly"
+                },
+                statistic="Maximum",
+                period=Duration.minutes(5)
+            ),
+            threshold=80,
+            evaluation_periods=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING
+        )
+        quota_warning_alarm.add_alarm_action(cw_actions.SnsAction(quota_alert_topic))
+
+        # Alarm for 95% quota usage (Critical)
+        quota_critical_alarm = cloudwatch.Alarm(
+            self, "AdobeAPIQuotaCritical",
+            alarm_name="adobe-api-quota-critical",
+            alarm_description="Alert when Adobe API usage reaches 95% of quota",
+            metric=cloudwatch.Metric(
+                namespace="PDFAccessibility",
+                metric_name="QuotaUsagePercentage",
+                dimensions_map={
+                    "APIName": "AdobeAPI",
+                    "Period": "Monthly"
+                },
+                statistic="Maximum",
+                period=Duration.minutes(5)
+            ),
+            threshold=95,
+            evaluation_periods=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING
+        )
+        quota_critical_alarm.add_alarm_action(cw_actions.SnsAction(quota_alert_topic))
+
+        # Alarm for quota exceeded errors
+        quota_exceeded_alarm = cloudwatch.Alarm(
+            self, "AdobeAPIQuotaExceeded",
+            alarm_name="adobe-api-quota-exceeded",
+            alarm_description="Alert when Adobe API quota is exceeded",
+            metric=cloudwatch.Metric(
+                namespace="PDFAccessibility",
+                metric_name="APIError",
+                dimensions_map={
+                    "APIName": "AdobeAPI",
+                    "ErrorType": "QuotaExceeded"
+                },
+                statistic="Sum",
+                period=Duration.minutes(5)
+            ),
+            threshold=1,
+            evaluation_periods=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING
+        )
+        quota_exceeded_alarm.add_alarm_action(cw_actions.SnsAction(quota_alert_topic))
+
+        # Add quota monitoring widgets to the dashboard
+        dashboard.add_widgets(
+            cloudwatch.GraphWidget(
+                title="Adobe API Quota Usage",
+                left=[
+                    cloudwatch.Metric(
+                        namespace="PDFAccessibility",
+                        metric_name="QuotaUsagePercentage",
+                        dimensions_map={
+                            "APIName": "AdobeAPI",
+                            "Period": "Monthly"
+                        },
+                        statistic="Maximum",
+                        period=Duration.hours(1),
+                        label="Quota Usage %"
+                    )
+                ],
+                width=12,
+                height=6
+            ),
+            cloudwatch.GraphWidget(
+                title="Adobe API Call Status",
+                left=[
+                    cloudwatch.Metric(
+                        namespace="PDFAccessibility",
+                        metric_name="APICallStatus",
+                        dimensions_map={
+                            "APIName": "AdobeAPI",
+                            "Status": "Success"
+                        },
+                        statistic="Sum",
+                        period=Duration.hours(1),
+                        label="Successful Calls",
+                        color=cloudwatch.Color.GREEN
+                    ),
+                    cloudwatch.Metric(
+                        namespace="PDFAccessibility",
+                        metric_name="APICallStatus",
+                        dimensions_map={
+                            "APIName": "AdobeAPI",
+                            "Status": "Failure"
+                        },
+                        statistic="Sum",
+                        period=Duration.hours(1),
+                        label="Failed Calls",
+                        color=cloudwatch.Color.RED
+                    )
+                ],
+                width=12,
+                height=6
+            )
+        )
+
+        # Export SNS topic ARN and DynamoDB table name for reference
+        cdk.CfnOutput(self, "QuotaAlertTopicArn",
+            value=quota_alert_topic.topic_arn,
+            description="SNS Topic ARN for quota alerts",
+            export_name="pdf-accessibility-quota-alert-topic-arn"
+        )
+        cdk.CfnOutput(self, "UsageTrackingTableName",
+            value=usage_tracking_table.table_name,
+            description="DynamoDB table for usage tracking",
+            export_name="pdf-accessibility-usage-tracking-table"
         )
 
 app = cdk.App()
