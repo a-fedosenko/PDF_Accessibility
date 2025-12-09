@@ -18,7 +18,8 @@ from aws_cdk import (
     aws_sns as sns,
     aws_sns_subscriptions as sns_subscriptions,
     aws_cloudwatch_actions as cw_actions,
-    aws_dynamodb as dynamodb
+    aws_dynamodb as dynamodb,
+    aws_apigateway as apigateway
 )
 from constructs import Construct
 import platform
@@ -69,6 +70,19 @@ class PDFAccessibility(Stack):
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             removal_policy=cdk.RemovalPolicy.RETAIN,
             point_in_time_recovery=True
+        )
+
+        # DynamoDB Table for Pending Jobs (Pre-Processing Analysis)
+        pending_jobs_table = dynamodb.Table(
+            self, "PendingJobsTable",
+            table_name="pdf-accessibility-pending-jobs",
+            partition_key=dynamodb.Attribute(
+                name="job_id",
+                type=dynamodb.AttributeType.STRING
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=cdk.RemovalPolicy.RETAIN,
+            time_to_live_attribute="ttl"
         )
 
         python_image_asset = ecr_assets.DockerImageAsset(self, "PythonImage",
@@ -435,7 +449,81 @@ class PDFAccessibility(Stack):
         # S3 Permissions for Lambda
         bucket.grant_read_write(split_pdf_lambda)
 
-        # Trigger Lambda on S3 Event
+        # ==========================================
+        # PRE-PROCESSING ANALYSIS LAMBDAS
+        # ==========================================
+
+        # PDF Analyzer Lambda - Analyzes PDFs without processing
+        pdf_analyzer_lambda = lambda_.Function(
+            self, 'PDFAnalyzer',
+            runtime=lambda_.Runtime.PYTHON_3_10,
+            handler='main.lambda_handler',
+            code=lambda_.Code.from_docker_build('lambda/pdf_analyzer'),
+            timeout=Duration.seconds(300),
+            memory_size=1024,
+            environment={
+                'PENDING_JOBS_TABLE': pending_jobs_table.table_name
+            },
+            architecture=lambda_arch
+        )
+
+        # Grant permissions to PDF Analyzer
+        bucket.grant_read(pdf_analyzer_lambda)
+        pending_jobs_table.grant_read_write_data(pdf_analyzer_lambda)
+        pdf_analyzer_lambda.add_to_role_policy(cloudwatch_logs_policy)
+
+        # Trigger PDF Analyzer on S3 upload to pdf-upload/ prefix
+        bucket.add_event_notification(
+            s3.EventType.OBJECT_CREATED,
+            s3n.LambdaDestination(pdf_analyzer_lambda),
+            s3.NotificationKeyFilter(prefix="pdf-upload/"),
+            s3.NotificationKeyFilter(suffix=".pdf")
+        )
+
+        # Start Remediation Lambda - Manually starts processing after approval
+        start_remediation_lambda = lambda_.Function(
+            self, 'StartRemediation',
+            runtime=lambda_.Runtime.PYTHON_3_10,
+            handler='main.lambda_handler',
+            code=lambda_.Code.from_docker_build('lambda/start_remediation'),
+            timeout=Duration.seconds(60),
+            memory_size=512,
+            environment={
+                'PENDING_JOBS_TABLE': pending_jobs_table.table_name,
+                'STATE_MACHINE_ARN': state_machine.state_machine_arn,
+                'S3_BUCKET_NAME': bucket.bucket_name
+            },
+            architecture=lambda_arch
+        )
+
+        # Grant permissions to Start Remediation Lambda
+        pending_jobs_table.grant_read_write_data(start_remediation_lambda)
+        bucket.grant_read_write(start_remediation_lambda)
+        state_machine.grant_start_execution(start_remediation_lambda)
+        start_remediation_lambda.add_to_role_policy(cloudwatch_logs_policy)
+
+        # API Gateway for Start Remediation endpoint
+        api = apigateway.RestApi(
+            self, "PDFAccessibilityAPI",
+            rest_api_name="PDF Accessibility API",
+            description="API for PDF accessibility processing",
+            default_cors_preflight_options=apigateway.CorsOptions(
+                allow_origins=apigateway.Cors.ALL_ORIGINS,
+                allow_methods=apigateway.Cors.ALL_METHODS,
+                allow_headers=["Content-Type", "Authorization"]
+            )
+        )
+
+        # Add /start-remediation endpoint
+        start_integration = apigateway.LambdaIntegration(start_remediation_lambda)
+        api.root.add_resource("start-remediation").add_method("POST", start_integration)
+
+        # ==========================================
+        # ORIGINAL S3 TRIGGER (KEPT FOR NOW)
+        # Note: This will be replaced by manual trigger via API
+        # ==========================================
+
+        # Trigger Lambda on S3 Event for pdf/ prefix (original workflow)
         bucket.add_event_notification(
             s3.EventType.OBJECT_CREATED,
             s3n.LambdaDestination(split_pdf_lambda),
@@ -654,6 +742,21 @@ class PDFAccessibility(Stack):
             value=usage_tracking_table.table_name,
             description="DynamoDB table for usage tracking",
             export_name="pdf-accessibility-usage-tracking-table"
+        )
+
+        # Export Pre-Processing Analysis resources
+        cdk.CfnOutput(self, "PendingJobsTableName",
+            value=pending_jobs_table.table_name,
+            description="DynamoDB table for pending jobs (pre-processing analysis)",
+            export_name="pdf-accessibility-pending-jobs-table"
+        )
+        cdk.CfnOutput(self, "APIURL",
+            value=api.url,
+            description="PDF Accessibility API URL"
+        )
+        cdk.CfnOutput(self, "APIStartRemediationEndpoint",
+            value=f"{api.url}start-remediation",
+            description="API endpoint to start remediation"
         )
 
 app = cdk.App()
